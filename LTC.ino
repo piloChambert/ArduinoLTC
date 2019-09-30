@@ -10,8 +10,8 @@ typedef byte LTCFrame[10];
 
 // store 2 frame
 volatile LTCFrame frames[2] = {
-  {0x40, 0x20, 0x20, 0x30, 0x40, 0x10, 0x20, 0x10, 0xFF, 0xFF},
-  {0x40, 0x20, 0x20, 0x30, 0x40, 0x10, 0x20, 0x10, 0xFF, 0xFF}
+  {0x40, 0x20, 0x20, 0x30, 0x40, 0x10, 0x20, 0x10, 0xFC, 0xBF},
+  {0x40, 0x20, 0x20, 0x30, 0x40, 0x10, 0x20, 0x10, 0xFC, 0xBF}
 };
 
 volatile byte currentFrameIndex; // current frame written by ISR
@@ -22,9 +22,10 @@ volatile unsigned short validBitCount;
 
 #define NOSYNC 0
 #define SYNCED 1
+#define GENERATOR 2
 volatile char state = 0;
 
-static unsigned short syncPattern = (B00111111 * 256) + B11111101;
+static unsigned short syncPattern = 0xBFFC;// (B00111111 * 256) + B11111101;
 volatile unsigned short syncValue;
 
 volatile byte frameBitCount;
@@ -50,7 +51,7 @@ ISR(TIMER1_CAPT_vect) {
   }
   
   // increment valid bit counts, without overflow
-  validBitCount += validBitCount < 65535 ? validBitCount + 1 : 0; 
+  validBitCount = validBitCount < 65535 ? validBitCount + 1 : 0; 
 
   currentBit = bitTime > BIT_TIME_THRESHOLD ? 0 : 1;
 
@@ -62,7 +63,7 @@ ISR(TIMER1_CAPT_vect) {
   lastBit = currentBit;
 
   // update frame sync pattern detection
-  syncValue = (syncValue << 1) + currentBit;
+  syncValue = (syncValue >> 1) + (currentBit << 15);
 
   // update state
   switch(state){
@@ -99,10 +100,15 @@ ISR(TIMER1_CAPT_vect) {
       byte bIdx = frameBitCount & 0x07;
       byte *f = frames[currentFrameIndex];
 
+      f[idx] = (f[idx] & ~(1 << bIdx)) | (currentBit << bIdx);
+
+      /*
       if(currentBit)
         f[idx] |= 1 << bIdx;
        else
         f[idx] &= ~(1 << bIdx);
+      */
+      
 
       frameBitCount++;
     }
@@ -111,26 +117,50 @@ ISR(TIMER1_CAPT_vect) {
 }
 
 ISR(TIMER1_OVF_vect) {
-  // if we overflow, we then lost signal
-  syncValue = 0;
-  validBitCount = 0;
-  validFrameCount = 0;
-  frameAvailable = false;
-  state = NOSYNC;
+  switch(state) {
+    case GENERATOR:
+    break;
+    default:
+      // if we overflow, we then lost signal
+      syncValue = 0;
+      validBitCount = 0;
+      validFrameCount = 0;
+      frameAvailable = false;
+      state = NOSYNC;
+      break;
+  }
 }
 
-void setup() {
-  Serial.begin(115200);
-  pinMode(ICP1, INPUT);                  // ICP pin (digital pin 8 on arduino) as input
+volatile byte generatorFramePosition = 0;
+volatile byte generatorFrameToggle = 0;
+LTCFrame testFrame = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFC, 0xBF};
+ISR(TIMER1_COMPA_vect) {
+  // toggle for 0 and 1;
+  if(!generatorFrameToggle) {
+    PORTB ^= (1 << 1);
 
-  pinMode(SIGNAL_LED, OUTPUT);
-  pinMode(LOCK_LED, OUTPUT);
+    if(generatorFramePosition == 0)
+      PORTD ^= (1 << 7); // debug, use to trigger the scope
+  }
+    
+  else {
+    byte idx = generatorFramePosition / 8;
+    byte bitIdx = generatorFramePosition & 0x07;
+    byte value = testFrame[idx] & (1 << bitIdx);
+    
+    // toggle for 1
+    if(value)
+      PORTB ^= (1 << 1);
 
-  digitalWrite(SIGNAL_LED, LOW);
-  digitalWrite(LOCK_LED, LOW);
+      generatorFramePosition++;
+      if(generatorFramePosition >= 80)
+        generatorFramePosition = 0;
+  }
 
-  Serial.println("Ready!");
+  generatorFrameToggle ^= 1; // toggle
+}
 
+void startLTCDecoder() {
   noInterrupts();
   TCCR1A = B00000000; // clear all
   TCCR1B = B11000010; // ICNC1 noise reduction + ICES1 start on rising edge + CS11 divide by 8
@@ -147,17 +177,69 @@ void setup() {
   currentFrameIndex = 0;
   validFrameCount = 0;
   frameAvailable = false;
+  state = NOSYNC;
   interrupts();
+}
+
+void stopLTCDecoder() {
+  noInterrupts();
+  TIMSK1 &= ~(1 << ICIE1);
+  TIMSK1 &= ~(1 << TOIE1);
+  
+  TCCR1B &= ~(1<< CS12);
+  TCCR1B &= ~(1<< CS11);
+  TCCR1B &= ~(1<< CS10);
+  interrupts();
+
+  digitalWrite(SIGNAL_LED, LOW); // valid after 1 frame
+  digitalWrite(LOCK_LED, LOW);
+  
+  frameAvailable = false;
+  state = NOSYNC;
+}
+
+void startLTCGenerator() {
+  noInterrupts(); 
+  TCCR1A = 0; // clear all
+  TCCR1B = (1 << WGM12) | (1 << CS10);
+  TIMSK1 = (1 << OCIE1A);
+
+  TCNT1 = 0; 
+  OCR1A = 3333; // 30 fps, 80 bits * 30
+
+  state = GENERATOR;
+
+  generatorFramePosition = 0;
+  interrupts();
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(ICP1, INPUT);                  // ICP pin (digital pin 8 on arduino) as input
+  pinMode(9, OUTPUT);
+
+  pinMode(SIGNAL_LED, OUTPUT);
+  pinMode(LOCK_LED, OUTPUT);
+
+  digitalWrite(SIGNAL_LED, LOW);
+  digitalWrite(LOCK_LED, LOW);
+
+  Serial.println("Ready!");
+
+  startLTCDecoder();
+  //startLTCGenerator();
 }
 
 void loop() {
   // status led
-  digitalWrite(SIGNAL_LED, validBitCount > 80 ? HIGH : LOW); // valid after 1 frame
-  digitalWrite(LOCK_LED, state == SYNCED? HIGH : LOW);
+  if(state != GENERATOR) {
+    digitalWrite(SIGNAL_LED, validBitCount > 80 ? HIGH : LOW); // valid after 1 frame
+    digitalWrite(LOCK_LED, state == SYNCED? HIGH : LOW);
+  }
 
   if(frameAvailable) {
     byte *fptr = frames[1 - currentFrameIndex];
-    Serial.print("Frame :");
+    Serial.print("Frame: ");
     Serial.print(validFrameCount - 1);
 
     Serial.print(" - ");
