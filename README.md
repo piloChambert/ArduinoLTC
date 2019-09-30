@@ -1,2 +1,2 @@
 # ArduinoLTC
-Arduino based SMPTE LTC decoder
+Arduino based SMPTE LTC decoder and generator.
