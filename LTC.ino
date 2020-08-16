@@ -1,4 +1,5 @@
-#define ICP1 8 // ICP1 for atmega368, 4 for atmega32u4
+#define ICP1 4 // ICP1, 8 for atmega368, 4 for atmega32u4
+#define LTC_OUT 9
 #define SIGNAL_LED 7
 #define LOCK_LED 6
 
@@ -131,33 +132,110 @@ ISR(TIMER1_OVF_vect) {
   }
 }
 
-volatile byte generatorFramePosition = 0;
-volatile byte generatorFrameToggle = 0;
-LTCFrame testFrame = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFC, 0xBF};
+struct LTCGenerator {
+  volatile byte bitIndex;
+  volatile byte bitToggle;
+  volatile LTCFrame outFrames[2];
+  volatile byte currentFrameIndex; // current frame read by ISR
+  volatile bool generateNewFrame;
+
+  int frame;
+  int seconds;
+  int minutes;
+  int hours;
+  
+  LTCGenerator() {
+    reset();
+  }
+
+  void reset() {
+    bitIndex = 0;
+    bitToggle = 0;
+    currentFrameIndex = 0;
+
+    // init frame data
+    memset(outFrames[0], 0, 10);
+    outFrames[0][8] = 0xFC; outFrames[0][9] = 0xBF; // sync pattern
+    
+    memset(outFrames[1], 0, 10);
+    outFrames[1][8] = 0xFC; outFrames[1][9] = 0xBF; // sync pattern
+
+    generateNewFrame = false;
+
+    frame = 0;
+    seconds = 0;
+    minutes = 0;
+    hours = 0;
+  }
+
+  // send current frame (should be call inside an ISR)
+  void interupt() {
+    // toggle for 0 and 1;
+    if(!bitToggle) {
+      PORTB ^= (1 << 5);
+
+      if(bitIndex == 0)
+        PORTD ^= (1 << 7); // debug, use to trigger the scope
+    }
+    else {
+      byte idx = bitIndex / 8;
+      byte bitIdx = bitIndex & 0x07;
+      byte value = outFrames[currentFrameIndex][idx] & (1 << bitIdx);
+      
+      // toggle for 1
+      if(value)
+        PORTB ^= (1 << 5);
+
+        bitIndex++;
+        if(bitIndex >= 80) {
+          // reset read position
+          bitIndex = 0;
+
+          // swtich frame
+          currentFrameIndex = 1 - currentFrameIndex;
+
+          generateNewFrame = true;
+        }
+    }
+
+    bitToggle ^= 1; // toggle
+  }
+
+  void update() {
+    if(generateNewFrame) {
+      generateNewFrame = false;
+      frame++;
+      if(frame > 30) {
+        frame = 0;
+        seconds++;
+      }
+
+      if(seconds > 60) {
+        minutes++;
+        seconds = 0;
+      }
+
+      if(minutes > 60) {
+        hours++;
+        minutes = 0;
+      }
+
+      // generate frame data
+      outFrames[1 - currentFrameIndex][0] = (frame % 10) & 0xf;
+      outFrames[1 - currentFrameIndex][1] = (frame / 10) & 0x3;
+      outFrames[1 - currentFrameIndex][2] = (seconds % 10) & 0xf;
+      outFrames[1 - currentFrameIndex][3] = (seconds / 10) & 0x7;
+      outFrames[1 - currentFrameIndex][4] = (minutes % 10) & 0xf;
+      outFrames[1 - currentFrameIndex][5] = (minutes / 10) & 0x7;
+      outFrames[1 - currentFrameIndex][6] = (hours % 10) & 0xf;
+      outFrames[1 - currentFrameIndex][7] = (hours / 10) & 0x3;
+    }
+  }
+
+} generator;
+
 ISR(TIMER1_COMPA_vect) {
-  // toggle for 0 and 1;
-  if(!generatorFrameToggle) {
-    PORTB ^= (1 << 1);
-
-    if(generatorFramePosition == 0)
-      PORTD ^= (1 << 7); // debug, use to trigger the scope
-  }
-    
-  else {
-    byte idx = generatorFramePosition / 8;
-    byte bitIdx = generatorFramePosition & 0x07;
-    byte value = testFrame[idx] & (1 << bitIdx);
-    
-    // toggle for 1
-    if(value)
-      PORTB ^= (1 << 1);
-
-      generatorFramePosition++;
-      if(generatorFramePosition >= 80)
-        generatorFramePosition = 0;
-  }
-
-  generatorFrameToggle ^= 1; // toggle
+  generator.interupt();
 }
 
 void startLTCDecoder() {
@@ -198,6 +276,7 @@ void stopLTCDecoder() {
   state = NOSYNC;
 }
 
+
 void startLTCGenerator() {
   noInterrupts(); 
   TCCR1A = 0; // clear all
@@ -205,18 +284,19 @@ void startLTCGenerator() {
   TIMSK1 = (1 << OCIE1A);
 
   TCNT1 = 0; 
-  OCR1A = 3333; // 30 fps, 80 bits * 30
+
+  // 30 fps, 80 bits * 30
+  OCR1A = 3333; // = 16000000 / (30 * 80 * 2)
 
   state = GENERATOR;
-
-  generatorFramePosition = 0;
+  generator.reset();
   interrupts();
 }
 
 void setup() {
   Serial.begin(115200);
   pinMode(ICP1, INPUT);                  // ICP pin (digital pin 8 on arduino) as input
-  pinMode(9, OUTPUT);
+  pinMode(LTC_OUT, OUTPUT);
 
   pinMode(SIGNAL_LED, OUTPUT);
   pinMode(LOCK_LED, OUTPUT);
@@ -224,39 +304,47 @@ void setup() {
   digitalWrite(SIGNAL_LED, LOW);
   digitalWrite(LOCK_LED, LOW);
 
+  while (!Serial) {
+    ; // wait for serial port to connect. Needed for native USB port only
+  }
   Serial.println("Ready!");
 
-  startLTCDecoder();
-  //startLTCGenerator();
+  //startLTCDecoder();
+  startLTCGenerator();
 }
+
+int previousOutputFrameIndex = 0;
 
 void loop() {
   // status led
   if(state != GENERATOR) {
     digitalWrite(SIGNAL_LED, validBitCount > 80 ? HIGH : LOW); // valid after 1 frame
     digitalWrite(LOCK_LED, state == SYNCED? HIGH : LOW);
+
+    if(frameAvailable) {
+      byte *fptr = frames[1 - currentFrameIndex];
+      Serial.print("Frame: ");
+      Serial.print(validFrameCount - 1);
+
+      Serial.print(" - ");
+
+      byte h = (fptr[7] & 0x03) * 10 + (fptr[6] & 0x0F);
+      byte m = (fptr[5] & 0x07) * 10 + (fptr[4] & 0x0F);
+      byte s = (fptr[3] & 0x07) * 10 + (fptr[2] & 0x0F);
+      byte f = (fptr[1] & 0x03) * 10 + (fptr[0] & 0x0F);
+
+      // hours
+      Serial.print(h);
+      Serial.print(":");
+      Serial.print(m);
+      Serial.print(":"); // seconds
+      Serial.print(s);
+      Serial.print(":"); // frame
+      Serial.println(f);
+      frameAvailable = false;
+    }
   }
-
-  if(frameAvailable) {
-    byte *fptr = frames[1 - currentFrameIndex];
-    Serial.print("Frame: ");
-    Serial.print(validFrameCount - 1);
-
-    Serial.print(" - ");
-
-    byte h = (fptr[7] & 0x03) * 10 + (fptr[6] & 0x0F);
-    byte m = (fptr[5] & 0x07) * 10 + (fptr[4] & 0x0F);
-    byte s = (fptr[3] & 0x07) * 10 + (fptr[2] & 0x0F);
-    byte f = (fptr[1] & 0x03) * 10 + (fptr[0] & 0x0F);
-
-    // hours
-    Serial.print(h);
-    Serial.print(":");
-    Serial.print(m);
-    Serial.print(":"); // seconds
-    Serial.print(s);
-    Serial.print(":"); // frame
-    Serial.println(f);
-    frameAvailable = false;
+  else {
+    generator.update();
   }
 }
